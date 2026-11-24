@@ -14,6 +14,8 @@
 //  (locked = 1) but the build completes (build = busy exempts table_gen's
 //  writes from the lock), so the table is frozen complete at done (FR-16).
 //============================================================================
+`timescale 1ns/1ps
+
 module progseq_top #(
     parameter NUM_STATES = 8,
     parameter SW         = $clog2(NUM_STATES)
@@ -44,7 +46,8 @@ module progseq_top #(
     wire [SW:0]   tg_addr, tg_wdata;
 
     // ---------------- start qualification ----------------
-    wire len_ok   = (length != {(SW+1){1'b0}}) && (length <= NUM_STATES);
+    localparam [SW:0] N_MAX = {1'b1, {SW{1'b0}}};   // = NUM_STATES (a power of two)
+    wire len_ok   = (length != {(SW+1){1'b0}}) && (length <= N_MAX);
     wire start_ok = start & ~busy & ~locked & len_ok;
 
     reg start_err_q;

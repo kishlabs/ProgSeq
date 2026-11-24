@@ -14,6 +14,8 @@
 //   leave a half-written table (spec FR-16). A locked table can never START a
 //   build (progseq_top rejects start), so this cannot modify a locked table.
 //============================================================================
+`timescale 1ns/1ps
+
 module progseq_core #(
     parameter NUM_STATES = 8,                 // power of two
     parameter SW         = $clog2(NUM_STATES) // state bits

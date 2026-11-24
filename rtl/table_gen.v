@@ -12,21 +12,33 @@
 //           (k <= length-1 : a full match is never counted as the answer)
 //   match = (i == length-1) && (b == P[length-1])
 //   boxes with i >= length are written as 0 (clears any old pattern)
+//   non-overlapping: the match word is written with next = 0
 //
-// Datapath registers : P, L, addr={i,b}, k ("Trying"), j ("which bit"), nxt
-// Controller         : IDLE, SETUP, CMP, WRITE, DONE
-// Width note         : k <= N-1 and j <= N-2, so SW bits suffice for both;
-//                      pos wraps cleanly in SW bits (0 <= pos <= i-1 < N).
+// Datapath (start-offset form):
+//   A guess k is tried as a start offset s = (i+1) - k into the received
+//   string. Column j compares received position p = s + j with P[j].
+//     - the newest bit b sits at position i  -> last column  <=> p == i
+//     - guess k = 1 is the last guess        <=> s == i
+//     - on a full match the answer k = j + 1
+//   s, p and j are plain registers updated by incrementers, so no
+//   multi-operand adder sits in front of the P[p] selector.
+//   The register holding length-1 (Lm1) replaces length: it needs SW bits and
+//   removes the L-1 decrementer from the SETUP decision path.
+// Controller : IDLE, SETUP, CMP, WRITE, DONE
 //============================================================================
+`timescale 1ns/1ps
+
 module table_gen #(
-    parameter NUM_STATES = 8,
+    parameter NUM_STATES = 8,                 // power of two, >= 4
     parameter SW         = $clog2(NUM_STATES)
 )(
     input                    clk,
     input                    rst_n,
-    input                    start,        // 1-clock pulse (ignored while busy)
+    input                    start,        // 1-clock pulse (qualified by progseq_top)
     input  [NUM_STATES-1:0]  pattern,
-    input  [SW:0]            length,
+    // verilator lint_off UNUSEDSIGNAL
+    input  [SW:0]            length,       // MSB only marks length = N (low bits 0): not needed
+    // verilator lint_on UNUSEDSIGNAL
     input                    overlap,
     // table write port (tg_* : table_gen side, before the write-port mux)
     output                   tg_we,
@@ -39,44 +51,43 @@ module table_gen #(
 
     reg [2:0]            st;
     reg [NUM_STATES-1:0] P;
-    reg [SW:0]           L;
+    reg [SW-1:0]         Lm1;      // length - 1  (0 .. N-1)
     reg                  ovl;
     reg [SW:0]           addr;     // {i, b}
-    reg [SW-1:0]         k;        // "Trying"
-    reg [SW-1:0]         j;        // "which bit"
+    reg [SW-1:0]         s;        // start offset of the current guess
+    reg [SW-1:0]         p;        // received position compared now (s + j)
+    reg [SW-1:0]         j;        // column
     reg [SW-1:0]         nxt;
     reg                  mreg;
 
     // ---------------- box being filled ----------------
-    wire [SW-1:0] i     = addr[SW:1];
-    wire          b     = addr[0];
-    wire [SW:0]   i_ext = {1'b0, i};
-
-    wire [SW:0]   lm1        = L - 1'b1;
-    wire          last_state = (i_ext == lm1);
-    wire          unused     = (i_ext >= L);
-    wire          m_calc     = last_state & (b == P[lm1[SW-1:0]]);
-    wire [SW:0]   kstart     = last_state ? i_ext : (i_ext + 1'b1);
+    wire [SW-1:0] i          = addr[SW:1];
+    wire          b          = addr[0];
+    wire          last_state = (i == Lm1);
+    wire          unused     = (i > Lm1);
+    wire          m_calc     = last_state & (b == P[Lm1]);
+    wire          no_guess   = last_state & (i == {SW{1'b0}});   // length = 1
 
     // ---------------- comparison datapath ----------------
-    wire [SW:0]   k_ext    = {1'b0, k};
-    wire [SW:0]   j_ext    = {1'b0, j};
-    // During CMP with !last_col, 0 <= i+1-k+j <= i-1 < 2**SW, so SW-bit mod arithmetic is exact
-    wire [SW-1:0] pos      = i + 1'b1 - k + j;
-    wire          last_col = ((j_ext + 1'b1) == k_ext);   // this column is the new bit b
-    wire          recv     = last_col ? b : P[pos];
+    wire          last_col = (p == i);            // received position p is the new bit b
+    wire          s_is_i   = (s == i);            // current guess is k = 1 (the last one)
+    wire          recv     = last_col ? b : P[p];
     wire          pat      = P[j];
     wire          eq       = (recv == pat);
+
+    wire [SW-1:0] s_inc    = s + 1'b1;
+    wire [SW-1:0] j_inc    = j + 1'b1;
 
     // ---------------- controller + registers ----------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             st   <= IDLE;
             P    <= {NUM_STATES{1'b0}};
-            L    <= {(SW+1){1'b0}};
+            Lm1  <= {SW{1'b0}};
             ovl  <= 1'b1;
             addr <= {(SW+1){1'b0}};
-            k    <= {SW{1'b0}};
+            s    <= {SW{1'b0}};
+            p    <= {SW{1'b0}};
             j    <= {SW{1'b0}};
             nxt  <= {SW{1'b0}};
             mreg <= 1'b0;
@@ -84,7 +95,7 @@ module table_gen #(
             case (st)
                 IDLE: if (start) begin
                     P    <= pattern;
-                    L    <= length;
+                    Lm1  <= length[SW-1:0] - 1'b1;   // exact for 1..N (N wraps to N-1)
                     ovl  <= overlap;
                     addr <= {(SW+1){1'b0}};
                     st   <= SETUP;
@@ -92,11 +103,13 @@ module table_gen #(
 
                 SETUP: begin
                     mreg <= m_calc;
-                    if (unused || (m_calc && !ovl) || (kstart == 0)) begin
+                    if (unused || no_guess) begin
                         nxt <= {SW{1'b0}};
                         st  <= WRITE;
                     end else begin
-                        k  <= kstart[SW-1:0];
+                        // first guess: k = i+1 (s = 0), or k = i in the last state (s = 1)
+                        s  <= {{(SW-1){1'b0}}, last_state};
+                        p  <= {{(SW-1){1'b0}}, last_state};
                         j  <= {SW{1'b0}};
                         st <= CMP;
                     end
@@ -104,18 +117,20 @@ module table_gen #(
 
                 CMP: begin
                     if (eq) begin
-                        if (last_col) begin           // all k bits matched
-                            nxt <= k;
+                        if (last_col) begin           // all k bits matched: answer k = j + 1
+                            nxt <= j_inc;
                             st  <= WRITE;
                         end else begin                // next column
-                            j <= j + 1'b1;
+                            j <= j_inc;
+                            p <= p + 1'b1;
                         end
                     end else begin
-                        if (k == 1) begin             // no guess left -> 0
+                        if (s_is_i) begin             // no guess left -> 0
                             nxt <= {SW{1'b0}};
                             st  <= WRITE;
-                        end else begin                // lower the guess, restart
-                            k <= k - 1'b1;
+                        end else begin                // shorter guess: s + 1, restart columns
+                            s <= s_inc;
+                            p <= s_inc;
                             j <= {SW{1'b0}};
                         end
                     end
@@ -138,7 +153,10 @@ module table_gen #(
     // ---------------- outputs ----------------
     assign tg_we    = (st == WRITE);
     assign tg_addr  = addr;
-    assign tg_wdata = {mreg, nxt};
+    // Non-overlapping mode: the match word returns to state 0. Applied here, on the
+    // registered mreg, so that the SETUP decision does not depend on the P[Lm1] selector.
+    wire          zero_next = mreg & ~ovl;
+    assign tg_wdata = {mreg, nxt & {SW{~zero_next}}};
     assign busy     = (st != IDLE);
     assign done     = (st == DONE);
 endmodule
